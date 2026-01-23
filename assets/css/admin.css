@@ -1,0 +1,38 @@
+.abc-admin-grid{
+  display:grid;
+  grid-template-columns: 1fr;
+  gap: 12px;
+  max-width: 900px;
+}
+.abc-admin-row label{
+  display:block;
+  font-weight:600;
+  margin-bottom: 4px;
+}
+.abc-admin-row input[type="text"], .abc-admin-row select, .abc-admin-row input[type="number"]{
+  width: 100%;
+  max-width: 520px;
+}
+.abc-surface{
+  border:1px solid #e5e5e5;
+  border-radius: 10px;
+  padding: 12px;
+  margin: 12px 0 18px;
+  background: #fff;
+}
+.abc-bg{
+  margin: 12px 0;
+  display:flex;
+  gap: 10px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.abc-bg-preview{
+  min-height: 60px;
+  min-width: 140px;
+  border:1px dashed #ddd;
+  padding: 6px;
+  border-radius: 8px;
+}
+.abc-bg-preview img{ max-height: 80px; width:auto; display:block; }
+.abc-fields-table input[type="text"], .abc-fields-table input[type="number"]{ width: 100%; }
