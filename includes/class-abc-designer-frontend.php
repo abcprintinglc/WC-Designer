@@ -78,21 +78,19 @@ class ABC_B2B_Designer_Frontend {
         }
     }
 
-    public function render_product_draft_launcher() {
+        public function render_product_draft_launcher() {
         if (!class_exists('WooCommerce')) return;
         if (!function_exists('is_product') || !is_product()) return;
 
         global $product;
         if (!$product || !is_a($product, 'WC_Product')) return;
-
         if (!is_user_logged_in()) return;
 
         $can_bypass = current_user_can('manage_options') || current_user_can(ABC_B2B_DESIGNER_BYPASS_CAP);
 
-        $org_id = abc_b2b_designer_current_user_org_id();
+        $org_id = (int) abc_b2b_designer_current_user_org_id();
         $approved = abc_b2b_designer_current_user_is_approved();
 
-        // If user has no org assigned, still show launcher for admins/bypass (can see all templates)
         if (!$org_id && !$can_bypass) {
             echo '<div class="abc-b2b-no-org">';
             echo '<strong>No Organization assigned.</strong> Your account is not linked to a customer Organization yet. ';
@@ -101,8 +99,6 @@ class ABC_B2B_Designer_Frontend {
             return;
         }
 
-
-        // If pending approval, show message only (no templates)
         if (!$approved && !$can_bypass) {
             $org_name = get_the_title($org_id);
             $organizer_first = abc_b2b_designer_org_organizer_first_name($org_id);
@@ -114,32 +110,46 @@ class ABC_B2B_Designer_Frontend {
         }
 
         $product_id = $product->get_id();
-        $templates = $this->templates_for_product((int)$product_id, (int)$org_id);
+        $templates = $this->templates_for_product((int) $product_id, (int) $org_id);
 
-        // Hide launcher if no templates available for this product/org
         if (empty($templates) && !$can_bypass) {
             return;
         }
 
+        $tpl_count = is_array($templates) ? count($templates) : 0;
         ?>
-        <div class="abc-designer-wrap" id="abc-draft-launcher" data-product-id="<?php echo (int)$product_id; ?>">
+        <div class="abc-designer-wrap" id="abc-draft-launcher" data-product-id="<?php echo (int) $product_id; ?>">
             <h3 class="abc-designer-title">Personalize with your brand template</h3>
-            <div class="abc-designer-row">
-                <div id="abc_template_notice" class="abc-template-notice" style="display:none;"></div>
-                <p class="abc-designer-help" style="margin:0;">
-                    Team workflow: Create a Draft, choose your template on the next page, customize it, mark ready, then your Organization Admin checks out.
-                </p>
-            </div>
-                <p class="abc-designer-help">Team workflow: Create a Draft, customize it, mark ready, then your Organization Admin checks out.</p>
-            </div>
 
-            <div class="abc-designer-actions">
+            <p class="abc-designer-help" style="margin:0 0 10px 0;">
+                Choose your template (e.g., Silver City / Deming), then click Create Draft &amp; Customize.
+            </p>
+
+            <?php if ($tpl_count > 0) : ?>
+                <?php $hide = ($tpl_count <= 1) ? 'style="display:none;"' : ''; ?>
+                <div class="abc-template-select" <?php echo $hide; ?>>
+                    <label for="abc_template_select" style="display:block;font-weight:600;margin-bottom:4px;">Choose Template</label>
+                    <select id="abc_template_select" style="min-width:260px;max-width:100%;">
+                        <?php if ($tpl_count > 1) : ?>
+                            <option value="">Select a template…</option>
+                        <?php endif; ?>
+                        <?php foreach ($templates as $t) : ?>
+                            <option value="<?php echo (int) $t->ID; ?>" <?php echo ($tpl_count === 1) ? 'selected="selected"' : ''; ?>>
+                                <?php echo esc_html(get_the_title($t->ID)); ?>
+                            </option>
+                        <?php endforeach; ?>
+                    </select>
+                </div>
+            <?php endif; ?>
+
+            <div class="abc-designer-actions" style="margin-top:10px;">
                 <button type="button" class="button button-primary" id="abc_create_draft">Create Draft &amp; Customize</button>
                 <span class="abc-save-status" id="abc_draft_status"></span>
             </div>
         </div>
         <?php
     }
+
 
     public function shortcode_draft_editor($atts = []) {
         if (!is_user_logged_in()) {

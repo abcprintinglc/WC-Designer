@@ -2,7 +2,7 @@
 /**
  * Plugin Name: ABC B2B Template Designer (Phase 1)
  * Description: B2B brand templates for WooCommerce products. Customers fill locked templates with editable fields; designs attach to orders.
- * Version: 0.2.3.1
+ * Version: 0.4.0
  * Author: ABC Printing Co. LLC (generated)
  * Requires at least: 6.0
  * Requires PHP: 7.4
@@ -11,7 +11,7 @@
 
 if (!defined('ABSPATH')) { exit; }
 
-define('ABC_B2B_DESIGNER_VERSION', '0.2.3.1');
+define('ABC_B2B_DESIGNER_VERSION', '0.4.0');
 // Users with this capability can bypass Organization filtering (in addition to Administrators).
 define('ABC_B2B_DESIGNER_BYPASS_CAP', 'abc_b2b_designer_bypass');
 
@@ -58,6 +58,7 @@ require_once ABC_B2B_DESIGNER_DIR . 'includes/helpers.php';
 require_once ABC_B2B_DESIGNER_DIR . 'includes/class-abc-designer-cpt.php';
 require_once ABC_B2B_DESIGNER_DIR . 'includes/class-abc-designer-org.php';
 require_once ABC_B2B_DESIGNER_DIR . 'includes/class-abc-designer-settings.php';
+require_once ABC_B2B_DESIGNER_DIR . 'includes/class-abc-designer-health.php';
 require_once ABC_B2B_DESIGNER_DIR . 'includes/class-abc-designer-ajax.php';
 require_once ABC_B2B_DESIGNER_DIR . 'includes/class-abc-designer-user-meta.php';
 require_once ABC_B2B_DESIGNER_DIR . 'includes/class-abc-designer-portal.php';
@@ -90,6 +91,7 @@ final class ABC_B2B_Designer_Plugin {
         ABC_B2B_Designer_CPT::instance();
         ABC_B2B_Designer_Org::instance();
         ABC_B2B_Designer_Settings::instance();
+        ABC_B2B_Designer_Health::instance();
         ABC_B2B_Designer_AJAX::instance();
         ABC_B2B_Designer_User_Meta::instance();
         ABC_B2B_Designer_Portal::instance();

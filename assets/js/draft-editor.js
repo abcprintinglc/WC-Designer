@@ -1,563 +1,816 @@
 /* global jQuery, ABCDRAFTED, fabric */
-(function($){
+jQuery(function ($) {
   'use strict';
 
-  const state = {
-    draft: null,
-    template: null,
-    surfaceKey: null,
-    canvas: null,
-    objectsByFieldKey: {},
-    currentSurfaceCfg: null,
-    payload: null
-  };
+  // -----------------------------
+  // Guardrails
+  // -----------------------------
+  if (typeof window.ABCDRAFTED === 'undefined') {
+    console.error('[ABC Draft Editor] ABCDRAFTED is undefined. Check wp_localize_script.');
+    return;
+  }
+  if (typeof window.fabric === 'undefined') {
+    console.error('[ABC Draft Editor] Fabric.js not loaded.');
+    return;
+  }
 
-  function ajaxGet(action, data){
+  var CFG = window.ABCDRAFTED;
+  if (!CFG.ajax_url || !CFG.nonce || !CFG.draft_id) {
+    console.error('[ABC Draft Editor] Missing config keys (ajax_url, nonce, draft_id).', CFG);
+    return;
+  }
+
+  // Ensure custom properties survive save/load
+  (function extendFabricSerialization() {
+    try {
+      var orig = fabric.Object.prototype.toObject;
+      fabric.Object.prototype.toObject = function (props) {
+        var o = orig.call(this, props);
+        o.abcFieldKey = this.abcFieldKey || null;
+        o.abcFieldAlign = this.abcFieldAlign || null;
+        o.abcFieldFontFamily = this.abcFieldFontFamily || null;
+        o.abcFieldFontSize = this.abcFieldFontSize || null;
+        o.abcFieldFill = this.abcFieldFill || null;
+        return o;
+      };
+    } catch (e) {
+      console.warn('[ABC Draft Editor] Could not extend fabric serialization', e);
+    }
+  })();
+
+  // -----------------------------
+  // DOM
+  // -----------------------------
+  var $qty = $('#abc_draft_qty');
+  var $orderDetails = $('#abc_order_details');
+  var $fieldsWrap = $('#abc_fields_form');
+  var $saveBtn = $('#abc_save_draft');
+  var $employeeBtn = $('#abc_employee_ready');
+  var $adminBtn = $('#abc_admin_ready');
+  var $addToCartBtn = $('#abc_add_draft_to_cart');
+  var $tplSelect = $('#abc_draft_template'); // if present
+
+  // -----------------------------
+  // Canvas
+  // -----------------------------
+  var canvas = new fabric.Canvas('abc_canvas', {
+    selection: false,
+    preserveObjectStacking: true
+  });
+
+  var fieldObjectMap = {}; // key -> fabric.Textbox
+  var currentTemplate = null;
+  var currentSurface = null;
+
+  var isAdmin = false;
+  var canBypass = false;
+
+  // Default to 96 px per inch unless template specifies
+  var PX_PER_IN = 96;
+
+  // -----------------------------
+  // Helpers
+  // -----------------------------
+  function esc(s) {
+    if (s === null || typeof s === 'undefined') return '';
+    return String(s)
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/\"/g, '&quot;')
+      .replace(/'/g, '&#039;');
+  }
+
+  function setLoading(msg) {
+    $fieldsWrap.html('<em>' + esc(msg || 'Loading…') + '</em>');
+  }
+
+  function post(action, data) {
     data = data || {};
     data.action = action;
-    data.nonce = ABCDRAFTED.nonce;
-    return $.get(ABCDRAFTED.ajax_url, data);
+    data.nonce = CFG.nonce;
+    return $.ajax({
+      url: CFG.ajax_url,
+      type: 'POST',
+      dataType: 'json',
+      data: data
+    });
   }
-  function ajaxPost(action, data){
+
+  function get(action, data) {
     data = data || {};
     data.action = action;
-    data.nonce = ABCDRAFTED.nonce;
-    return $.post(ABCDRAFTED.ajax_url, data);
-  }
-
-  function setStatus(msg, isErr){
-    const $s = $('#abc_save_status');
-    if(!$s.length) return;
-    $s.text(msg || '').toggleClass('abc-error', !!isErr);
-  }
-
-  function escapeHtml(s){
-    return String(s || '').replace(/[&<>"']/g, (m)=>({ '&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;' }[m]));
-  }
-
-  function ensureFontsLoaded(fields){
-    if(!document.fonts || !document.fonts.load) return Promise.resolve();
-    const fams = Array.from(new Set((fields||[]).map(f=>f.fontFamily).filter(Boolean)));
-    return Promise.all(fams.map(fam=>document.fonts.load('16px "'+fam+'"').catch(()=>null))).then(()=>null);
-  }
-
-  function surfaceInches(cfg){
-    const trimW = Number(cfg.trim_w_in || 3.5);
-    const trimH = Number(cfg.trim_h_in || 2.0);
-    const bleed = Number(cfg.bleed_in || 0);
-    return { w: trimW + 2*bleed, h: trimH + 2*bleed, bleed: bleed };
-  }
-
-  function resizeCanvasForSurface(cfg){
-    const el = document.getElementById('abc_canvas');
-    if(!el || !state.canvas) return;
-
-    const inch = surfaceInches(cfg);
-    const maxW = 980; // display width
-    const w = maxW;
-    const h = Math.round(maxW * (inch.h / inch.w));
-    el.width = w;
-    el.height = h;
-    state.canvas.setWidth(w);
-    state.canvas.setHeight(h);
-    state.canvas.calcOffset();
-  }
-
-  function buildSurfaceTabs(){
-    const $tabs = $('#abc_surface_tabs');
-    $tabs.empty();
-    const keys = state.template ? Object.keys(state.template.surfaces || {}) : [];
-    if(keys.length <= 1){
-      $tabs.hide();
-      return;
-    }
-    $tabs.show();
-    keys.forEach(k=>{
-      const btn = $('<button type="button" class="button abc-surface-tab"/>').text((state.template.surfaces[k].label || k));
-      btn.on('click', ()=>loadSurface(k));
-      $tabs.append(btn);
+    data.nonce = CFG.nonce;
+    return $.ajax({
+      url: CFG.ajax_url,
+      type: 'GET',
+      dataType: 'json',
+      data: data
     });
   }
 
-  function setActiveTab(key){
-    $('#abc_surface_tabs .abc-surface-tab').each(function(){
-      const label = $(this).text();
-      const targetLabel = (state.template.surfaces[key].label || key);
-      $(this).toggleClass('is-active', label === targetLabel);
-    });
+  function toNum(v, def) {
+    var n = parseFloat(v);
+    return (isNaN(n) ? def : n);
   }
 
-  function loadBackground(cfg){
-    return new Promise((resolve)=>{
-      const bg = cfg.bg_url || '';
-      if(!bg){
-        state.canvas.setBackgroundImage(null, state.canvas.renderAll.bind(state.canvas));
-        resolve();
+  function lockAllObjects() {
+    // Users should not drag/move objects; only admins/bypass can.
+    var lock = !(isAdmin || canBypass);
+    canvas.selection = !lock;
+
+    canvas.forEachObject(function (obj) {
+      if (!obj) return;
+
+      if (obj.abcIsBackground) {
+        obj.selectable = false;
+        obj.evented = false;
         return;
       }
-      fabric.Image.fromURL(bg, function(img){
-        // scale to fit full canvas
-        const cw = state.canvas.getWidth();
-        const ch = state.canvas.getHeight();
-        const scale = Math.max(cw / img.width, ch / img.height);
-        img.set({ originX:'left', originY:'top', left:0, top:0, selectable:false, evented:false, scaleX:scale, scaleY:scale });
-        state.canvas.setBackgroundImage(img, state.canvas.renderAll.bind(state.canvas));
-        resolve();
-      }, { crossOrigin: 'anonymous' });
-    });
-  }
 
-  function buildObjectsForSurface(cfg){
-    state.objectsByFieldKey = {};
-    state.currentSurfaceCfg = cfg;
+      obj.selectable = !lock;
+      obj.evented = !lock;
 
-    state.canvas.getObjects().forEach(o=>{ if(o && o._abcFieldKey){ state.canvas.remove(o); }});
-    const fields = Array.isArray(cfg.fields) ? cfg.fields : [];
+      obj.lockMovementX = lock;
+      obj.lockMovementY = lock;
+      obj.lockScalingX = lock;
+      obj.lockScalingY = lock;
+      obj.lockRotation = lock;
 
-    const inch = surfaceInches(cfg);
-    const cw = state.canvas.getWidth();
-    const ch = state.canvas.getHeight();
-    const pxPerInX = cw / inch.w;
-    const pxPerInY = ch / inch.h;
-
-    fields.forEach(f=>{
-      const key = String(f.key || '').trim();
-      if(!key) return;
-      const x = Number(f.x_in || 0) * pxPerInX;
-      const y = Number(f.y_in || 0) * pxPerInY;
-      const w = Math.max(10, Number(f.w_in || 1.0) * pxPerInX);
-      const fontSize = Math.max(8, Number(f.fontSize || 12));
-      const fill = f.color || '#111111';
-      const align = (f.align || 'left');
-
-      const txt = new fabric.Textbox('', {
-        left: x, top: y,
-        width: w,
-        fontFamily: f.fontFamily || 'Arial',
-        fontWeight: f.fontWeight || 'normal',
-        fontStyle: f.fontStyle || 'normal',
-        fontSize: fontSize,
-        fill: fill,
-        textAlign: align,
-        editable: false,
-        selectable: false,
-        evented: false
-      });
-      txt._abcFieldKey = key;
-      state.canvas.add(txt);
-      state.objectsByFieldKey[key] = txt;
+      obj.hasControls = !lock;
+      obj.hasBorders = !lock;
     });
 
-    state.canvas.renderAll();
+    canvas.requestRenderAll();
   }
 
-  function buildFieldsForm(cfg){
-    const $form = $('#abc_fields_form');
-    $form.empty();
-    const fields = Array.isArray(cfg.fields) ? cfg.fields : [];
-    if(!fields.length){
-      $form.html('<em>No editable fields defined for this surface.</em>');
-      return;
-    }
-
-    fields.forEach(f=>{
-      const key = String(f.key || '').trim();
-      const label = f.label || key;
-      const val = (state.payload && state.payload.surfaces && state.payload.surfaces[state.surfaceKey] && state.payload.surfaces[state.surfaceKey].fields && state.payload.surfaces[state.surfaceKey].fields[key]) ? state.payload.surfaces[state.surfaceKey].fields[key] : '';
-      const $row = $('<div class="abc-field-row"/>');
-      $row.append('<label><strong>'+escapeHtml(label)+'</strong></label>');
-      const $input = $('<input type="text" class="abc-field-input"/>').attr('data-key', key).val(val);
-      $input.on('input', function(){
-        const k = $(this).data('key');
-        const v = $(this).val();
-        if(state.objectsByFieldKey[k]) { state.objectsByFieldKey[k].set('text', v); state.canvas.renderAll(); }
-      });
-      $row.append($input);
-      $form.append($row);
-    });
-  }
-
-  function applyPayloadToObjects(){
-    if(!state.payload || !state.payload.surfaces) return;
-    const s = state.payload.surfaces[state.surfaceKey];
-    if(!s || !s.fields) return;
-
-    Object.keys(s.fields).forEach(k=>{
-      const v = s.fields[k];
-      if(state.objectsByFieldKey[k]) {
-        state.objectsByFieldKey[k].set('text', v || '');
-      }
-      $('#abc_fields_form .abc-field-input[data-key="'+k+'"]').val(v || '');
-    });
-    state.canvas.renderAll();
-  }
-
-  function loadSurface(key){
-    if(!state.template || !state.template.surfaces || !state.template.surfaces[key]) return;
-    state.surfaceKey = key;
-    const cfg = state.template.surfaces[key];
-    setActiveTab(key);
-    resizeCanvasForSurface(cfg);
-
-    setStatus('Loading surface…');
-    ensureFontsLoaded(cfg.fields || []).then(()=>{
-      return loadBackground(cfg);
-    }).then(()=>{
-      buildObjectsForSurface(cfg);
-      buildFieldsForm(cfg);
-      applyPayloadToObjects();
-      setStatus('');
-    });
-  }
-
-  function exportSurfacePng(){
-    try{
-      return state.canvas.toDataURL({ format:'png', multiplier: 3 });
-    }catch(e){
-      return null;
-    }
-  }
-
-  function updatePreviewList(){
-    const $p = $('#abc_preview_list');
-    $p.empty();
-    const previews = (state.draft && state.draft.previews) ? state.draft.previews : {};
-    const keys = Object.keys(previews || {});
-    if(!keys.length){
-      $p.html('<em>No previews saved yet.</em>');
-      return;
-    }
-    keys.forEach(k=>{
-      const url = previews[k];
-      const $img = $('<img/>').attr('src', url).attr('alt', k).css({ maxWidth:'100%', border:'1px solid #ddd', borderRadius:'8px', marginBottom:'8px' });
-      $p.append('<div><strong>'+escapeHtml(k)+'</strong></div>');
-      $p.append($img);
-    });
-  }
-
-  function resetReadyUI(){
-    // after any change, ready flags are reset server-side; refresh draft state
-    return fetchDraft();
-  }
-
-  function fetchDraft(){
-    return ajaxGet('abc_b2b_get_draft', { draft_id: ABCDRAFTED.draft_id }).done(function(resp){
-      if(!resp || !resp.success){
-        setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Unable to load draft.', true);
-        return;
-      }
-      state.draft = resp.data.draft;
-      // qty
-      $('#abc_draft_qty').val(state.draft.qty || 1);
-
-      // admin controls
-      const isOrgAdmin = !!state.draft.is_org_admin || !!state.draft.can_bypass;
-      if(isOrgAdmin){
-        $('#abc_admin_ready').show();
-        $('.abc-override-wrap').show();
-      } else {
-        $('#abc_admin_ready').hide();
-        $('.abc-override-wrap').hide();
-      }
-
-
-  function fetchTemplatesForDraft(){
-    if(!state.draft) return $.Deferred().reject().promise();
-    return ajaxGet('abc_b2b_get_templates', { product_id: state.draft.product_id }).done(function(resp){
-      if(!resp || !resp.success){
-        setStatus('Unable to load templates.', true);
-        return;
-      }
-      const data = resp.data || {};
-      const list = data.templates || [];
-      const $pick = $('#abc_draft_template_picker');
-      const $sel = $('#abc_draft_template_select');
-      $sel.empty();
-      if(!list.length){
-        $pick.hide();
-        return;
-      }
-      $sel.append($('<option/>').val('').text('Select a template…'));
-      list.forEach(t=>{
-        $sel.append($('<option/>').val(t.id).text(t.title));
-      });
-
-      if(state.draft.template_id){
-        $sel.val(String(state.draft.template_id));
-        $('#abc_template_apply').hide();
-        $('#abc_template_switch').show();
-        $pick.show();
-      } else {
-        $('#abc_template_apply').show();
-        $('#abc_template_switch').hide();
-        $pick.show();
-      }
-    });
-  }
-
-  function renderOrderDetails(){
-    if(!state.draft) return;
-    const $d = $('#abc_order_details');
-    if(!$d.length) return;
-    const title = state.draft.product_title ? escapeHtml(state.draft.product_title) : ('Product #' + state.draft.product_id);
-    const qty = parseInt(state.draft.qty || 1, 10);
-    let attrs = '';
-    if(state.draft.attributes && typeof state.draft.attributes === 'object'){
-      const parts=[];
-      Object.keys(state.draft.attributes).forEach(k=>{
-        parts.push(escapeHtml(k) + ': ' + escapeHtml(state.draft.attributes[k]));
-      });
-      if(parts.length) attrs = '<div class="abc-muted" style="margin-top:4px;">' + parts.join('<br>') + '</div>';
-    }
-    $d.html('<strong>Draft Order Details</strong><div style="margin-top:4px;">' + title + '</div><div class="abc-muted">Qty: ' + qty + '</div>' + attrs);
-  }
-
-      $('#abc_ready_override').prop('checked', !!state.draft.ready_override);
-
-      // Add to cart visibility
-      const fullyApproved = (state.draft.employee_ready && state.draft.admin_ready) || state.draft.ready_override;
-      if(isOrgAdmin && fullyApproved){
-        $('#abc_add_draft_to_cart').show();
-      } else {
-        $('#abc_add_draft_to_cart').hide();
-      }
-
-      // Button states
-      $('#abc_employee_ready').toggleClass('button-primary', !!state.draft.employee_ready);
-      $('#abc_admin_ready').toggleClass('button-primary', !!state.draft.admin_ready);
-
-      // previews
-      updatePreviewList();
-      if(state.draft && state.draft.payload){
-        state.payload = state.draft.payload;
-      } else if(!state.payload){
-        state.payload = { template_id: state.draft.template_id, product_id: state.draft.product_id, created: new Date().toISOString(), surfaces: {} };
-      }
-
-      // view cart link
-      if(state.draft.cart_url){
-        $('#abc_view_cart').attr('href', state.draft.cart_url);
-      }
-    });
-  }
-
-  function fetchTemplate(){
-    const tid = state.draft.template_id;
-    return ajaxGet('abc_b2b_get_template', { template_id: tid }).done(function(resp){
-      if(!resp || !resp.success){
-        setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Unable to load template.', true);
-        return;
-      }
-      state.template = resp.data.template;
-      buildSurfaceTabs();
-
-      // init canvas if needed
-      if(!state.canvas){
-        state.canvas = new fabric.Canvas('abc_canvas', { selection: false, preserveObjectStacking: true });
-      }
-
-      const keys = Object.keys(state.template.surfaces || {});
-      const first = keys.length ? keys[0] : null;
-      if(!first){
-        setStatus('Template has no surfaces.', true);
-        return;
-      }
-      loadSurface(first);
-    });
-  }
-
-  function saveDraft(){
-    if(!state.template || !state.canvas){
-      setStatus('Template not ready.', true);
-      return;
-    }
-
-    // Merge surface fields into payload
-    const skey = state.surfaceKey || 'front';
-    if(!state.payload.surfaces) state.payload.surfaces = {};
-    if(!state.payload.surfaces[skey]) state.payload.surfaces[skey] = { fields: {} };
-    const fields = state.payload.surfaces[skey].fields;
-
-    Object.keys(state.objectsByFieldKey).forEach(k=>{
-      const obj = state.objectsByFieldKey[k];
-      fields[k] = obj && obj.text ? obj.text : '';
-    });
-
-    const previews = {};
-    const svgs = {};
-    setStatus('Preparing fonts…');
-    ensureFontsLoaded(state.currentSurfaceCfg ? state.currentSurfaceCfg.fields : []).then(()=>{
-      previews[skey] = exportSurfacePng();
-      try { svgs[skey] = state.canvas.toSVG(); } catch(e) {}
-
-      setStatus('Saving proof…');
-      return ajaxPost('abc_b2b_save_draft', {
-        draft_id: ABCDRAFTED.draft_id,
-        payload: JSON.stringify(state.payload),
-        previews: previews,
-        svgs: svgs
-      });
-    }).done(function(resp){
-      if(!resp || !resp.success){
-        setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Save failed.', true);
-        return;
-      }
-      setStatus('Saved. Approvals reset (mark Ready again).');
-      // refresh draft
-      fetchDraft();
-    }).fail(function(){
-      setStatus('Save failed.', true);
-    });
-  }
-
-  function wireUI(){
-    // Save
-    $('#abc_save_draft').on('click', saveDraft);
-
-    // Qty
-    let qtyTimer = null;
-    $('#abc_draft_qty').on('input', function(){
-      const v = parseInt($(this).val() || '1', 10);
-      const qty = isNaN(v) ? 1 : Math.max(1, v);
-      clearTimeout(qtyTimer);
-      qtyTimer = setTimeout(function(){
-        setStatus('Saving quantity…');
-        ajaxPost('abc_b2b_update_draft_qty', { draft_id: ABCDRAFTED.draft_id, qty: qty }).done(function(resp){
-          if(!resp || !resp.success){
-            setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Qty save failed.', true);
-            return;
-    // Template apply/switch (template-first flow)
-    $('#abc_template_apply').on('click', function(){
-      const tid = parseInt($('#abc_draft_template_select').val() || '0', 10);
-      if(!tid){
-        setStatus('Choose a template first.', true);
-        return;
-      }
-      setStatus('Applying template…');
-      ajaxPost('abc_b2b_set_draft_template', { draft_id: ABCDRAFTED.draft_id, template_id: tid }).done(function(resp){
-        if(!resp || !resp.success){
-          setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Unable to apply template.', true);
-          return;
-        }
-        // reload draft/template
-        fetchDraft().done(function(r){
-          if(r && r.success){
-            $('#abc_template_apply').hide();
-            $('#abc_template_switch').show();
-            fetchTemplate();
+  function pickVariationValue(draft, needleRegex) {
+    try {
+      if (!draft) return '';
+      // Prefer structured attributes
+      var attrs = draft.variation_attributes;
+      if (Array.isArray(attrs)) {
+        for (var i = 0; i < attrs.length; i++) {
+          var a = attrs[i] || {};
+          var label = (a.label || a.name || '').toString();
+          var name = (a.name || '').toString();
+          if (needleRegex.test(label.toLowerCase()) || needleRegex.test(name.toLowerCase())) {
+            return (a.value || '').toString();
           }
-        });
-      });
-    });
-
-    $('#abc_template_switch').on('click', function(){
-      const tid = parseInt($('#abc_draft_template_select').val() || '0', 10);
-      if(!tid){
-        setStatus('Choose a template first.', true);
-        return;
+        }
       }
-      if(!confirm('Switch template? This will reset approvals and clear saved previews.')) return;
-      setStatus('Switching template…');
-      ajaxPost('abc_b2b_set_draft_template', { draft_id: ABCDRAFTED.draft_id, template_id: tid }).done(function(resp){
-        if(!resp || !resp.success){
-          setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Unable to switch template.', true);
-          return;
+      // Fallback: parse variation_string
+      var s = (draft.variation_string || '').toString();
+      // best-effort: split by commas and look for "Label: Value"
+      var parts = s.split(',');
+      for (var j = 0; j < parts.length; j++) {
+        var p = parts[j].trim();
+        var pLower = p.toLowerCase();
+        if (needleRegex.test(pLower)) {
+          var idx = p.indexOf(':');
+          if (idx >= 0) return p.slice(idx + 1).trim();
+          return p.trim();
         }
-        // Clear UI
-        $('#abc_preview_list').html('<em>No previews saved yet.</em>');
-        state.canvas && state.canvas.clear();
-        state.objectsByFieldKey = {};
-        fetchDraft().done(function(r){
-          if(r && r.success){
-            fetchTemplate();
-          }
-        });
-      });
-    });
-  }
-          setStatus('Quantity saved. Approvals reset.');
-          fetchDraft();
-        }).fail(function(){
-          setStatus('Qty save failed.', true);
-        });
-      }, 400);
-    });
-
-    // Ready buttons
-    $('#abc_employee_ready').on('click', function(){
-      setStatus('Marking employee ready…');
-      ajaxPost('abc_b2b_set_employee_ready', { draft_id: ABCDRAFTED.draft_id }).done(function(resp){
-        if(!resp || !resp.success){
-          setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Unable to mark ready.', true);
-          return;
-        }
-        setStatus('Employee Ready set.');
-        fetchDraft();
-      }).fail(()=>setStatus('Unable to mark ready.', true));
-    });
-
-    $('#abc_admin_ready').on('click', function(){
-      setStatus('Marking org admin ready…');
-      ajaxPost('abc_b2b_set_admin_ready', { draft_id: ABCDRAFTED.draft_id }).done(function(resp){
-        if(!resp || !resp.success){
-          setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Unable to approve.', true);
-          return;
-        }
-        setStatus('Org Admin Ready set.');
-        fetchDraft();
-      }).fail(()=>setStatus('Unable to approve.', true));
-    });
-
-    $('#abc_ready_override').on('change', function(){
-      const val = $(this).is(':checked');
-      setStatus('Updating override…');
-      ajaxPost('abc_b2b_set_ready_override', { draft_id: ABCDRAFTED.draft_id, override: val ? 1 : 0 }).done(function(resp){
-        if(!resp || !resp.success){
-          setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Override update failed.', true);
-          return;
-        }
-        setStatus('Override updated.');
-        fetchDraft();
-      }).fail(()=>setStatus('Override update failed.', true));
-    });
-
-    $('#abc_add_draft_to_cart').on('click', function(){
-      setStatus('Adding to cart…');
-      ajaxPost('abc_b2b_add_draft_to_cart', { draft_id: ABCDRAFTED.draft_id }).done(function(resp){
-        if(!resp || !resp.success){
-          setStatus((resp && resp.data && resp.data.message) ? resp.data.message : 'Add to cart failed.', true);
-          return;
-        }
-        setStatus('Added to cart.');
-        const cartUrl = (resp.data && resp.data.cart_url) ? resp.data.cart_url : (state.draft && state.draft.cart_url ? state.draft.cart_url : '#');
-        if(cartUrl){
-          $('#abc_view_cart').attr('href', cartUrl).show();
-        }
-      }).fail(()=>setStatus('Add to cart failed.', true));
-    });
+      }
+      return '';
+    } catch (e) {
+      return '';
+    }
   }
 
-  $(function(){
-    if(!$('#abc-draft-editor').length) return;
-    if(!ABCDRAFTED || !ABCDRAFTED.draft_id){
-      setStatus('Missing draft id.', true);
-      return;
+  function buildOptionsSummary(draft) {
+    // Build a clean, human readable options line in a consistent order
+    var chunks = [];
+    var used = {};
+
+    function add(label, value) {
+      if (!value) return;
+      var key = label.toLowerCase();
+      if (used[key]) return;
+      used[key] = true;
+      chunks.push(label + ': ' + value);
     }
 
-    wireUI();
+    // Preferred fields
+    add('Stock', pickVariationValue(draft, /stock|paper/));
+    add('Ink', pickVariationValue(draft, /ink/));
+    add('Sides', pickVariationValue(draft, /side/));
 
-    fetchDraft().done(function(resp){
-      if(resp && resp.success){
-        renderOrderDetails();
-        fetchTemplatesForDraft().done(function(){
-          if(state.draft && state.draft.template_id){
-            fetchTemplate();
+    // Add any remaining attributes not already included
+    if (Array.isArray(draft.variation_attributes)) {
+      for (var i = 0; i < draft.variation_attributes.length; i++) {
+        var a = draft.variation_attributes[i] || {};
+        var label = (a.label || a.name || '').toString();
+        var value = (a.value || '').toString();
+        var lower = label.toLowerCase();
+        if (!label || !value) continue;
+        if (/(stock|paper|ink|side)/.test(lower)) continue;
+        add(label, value);
+      }
+    } else if (draft.variation_string) {
+      // last fallback
+      chunks = [draft.variation_string];
+    }
+
+    return chunks.join(', ');
+  }
+
+  function renderInlineOptions(draft) {
+    // Shows Ink + Sides next to Qty (top-left), per your markup.
+    try {
+      if (!$qty.length) return;
+      var $wrap = $('#abc_inline_options');
+      if (!$wrap.length) {
+        $wrap = $('<div id="abc_inline_options" style="display:inline-flex;gap:14px;align-items:center;margin-left:16px;vertical-align:middle;"></div>');
+        // insert after qty input
+        $qty.after($wrap);
+      }
+
+      var ink = pickVariationValue(draft, /ink/);
+      var sides = pickVariationValue(draft, /side/);
+
+      var html = '';
+      if (ink) {
+        html += '<span class="abc-inline-opt"><strong>Ink:</strong> ' + esc(ink) + '</span>';
+      }
+      if (sides) {
+        html += '<span class="abc-inline-opt"><strong>Sides:</strong> ' + esc(sides) + '</span>';
+      }
+      if (!html) {
+        html = '<span class="abc-inline-opt"><em>Options:</em> ' + esc(draft.variation_string || '') + '</span>';
+      }
+
+      $wrap.html(html);
+    } catch (e) {
+      console.warn('[ABC Draft Editor] renderInlineOptions failed', e);
+    }
+  }
+
+  function setOrderHeader(draft) {
+    try {
+      var title = draft.product_title ? esc(draft.product_title) : '';
+      var options = buildOptionsSummary(draft);
+      var html = '';
+      if (title) html += '<div><strong>Product:</strong> ' + title + '</div>';
+      if (options) html += '<div><strong>Options:</strong> ' + esc(options) + '</div>';
+
+      // show qty in the summary box as well
+      var q = parseInt(draft.qty, 10);
+      if (!q || q < 1) q = 1;
+      html += '<div><strong>Amount:</strong> ' + esc(q) + '</div>';
+
+      $orderDetails.html(html || '');
+
+      // Also render the inline (left-side) quick options
+      renderInlineOptions(draft);
+    } catch (e) {
+      console.warn('[ABC Draft Editor] Could not set header', e);
+    }
+  }
+
+  function setQtyInput(qtyVal) {
+    if (!$qty.length) return;
+    var q = parseInt(qtyVal, 10);
+    if (!q || q < 1) q = 1;
+    $qty.val(q);
+  }
+
+  function bindQtyChange() {
+    if (!$qty.length) return;
+    $qty.off('change.abc').on('change.abc', function () {
+      var q = parseInt($qty.val(), 10);
+      if (!q || q < 1) q = 1;
+      $qty.val(q);
+
+      // changing qty resets approvals server-side
+      post('abc_b2b_update_draft_qty', {
+        draft_id: CFG.draft_id,
+        qty: q
+      }).done(function (res) {
+        if (!res || !res.success) {
+          console.warn('[ABC Draft Editor] Qty update failed', res);
+        } else {
+          // reflect on-screen; approvals reset happens server-side
+          updateApprovalUI({ employee_ready: 0, admin_ready: 0, ready_override: 0, is_org_admin: isAdmin, can_bypass: canBypass });
+        }
+      }).fail(function (xhr) {
+        console.error('[ABC Draft Editor] Qty update AJAX failed', xhr);
+      });
+    });
+  }
+
+  function updateApprovalUI(draft) {
+    // draft contains: employee_ready, admin_ready, ready_override, is_org_admin, can_bypass
+    try {
+      if (draft.employee_ready) {
+        $employeeBtn.text('Employee Ready ✓').prop('disabled', true);
+      } else {
+        $employeeBtn.text('Employee Ready').prop('disabled', false);
+      }
+
+      // Admin button visibility
+      if (draft.is_org_admin || draft.can_bypass) {
+        $adminBtn.show();
+        if (draft.admin_ready) {
+          $adminBtn.text('Org Admin Ready ✓').prop('disabled', true);
+        } else {
+          $adminBtn.text('Org Admin Ready').prop('disabled', false);
+        }
+      } else {
+        $adminBtn.hide();
+      }
+
+      // Add to cart visibility (only when fully approved OR override)
+      var approved = (!!draft.ready_override) || (!!draft.employee_ready && !!draft.admin_ready);
+      if (approved && (draft.is_org_admin || draft.can_bypass)) {
+        $addToCartBtn.show();
+      } else {
+        $addToCartBtn.hide();
+      }
+    } catch (e) {
+      console.warn('[ABC Draft Editor] updateApprovalUI error', e);
+    }
+  }
+
+  function pickFirstSurface(template) {
+    if (!template || !template.surfaces) return null;
+    if (Array.isArray(template.surfaces) && template.surfaces.length) return template.surfaces[0];
+    // sometimes surfaces saved as object map
+    if (typeof template.surfaces === 'object') {
+      var keys = Object.keys(template.surfaces);
+      if (keys.length) return template.surfaces[keys[0]];
+    }
+    return null;
+  }
+
+  function normalizeFields(surface) {
+    if (!surface) return [];
+    var fields = surface.fields || surface.text_fields || surface.textFields || [];
+    if (!Array.isArray(fields)) return [];
+    return fields;
+  }
+
+  function bgUrlFromSurface(surface) {
+    if (!surface) return '';
+    return surface.bg_url || surface.bgUrl || surface.background_url || surface.backgroundUrl || '';
+  }
+
+  function setCanvasSizeFromSurface(surface) {
+    // Use surface inches + DPI if available, otherwise use existing canvas size
+    var wIn = toNum(surface.width_in || surface.widthIn, 0);
+    var hIn = toNum(surface.height_in || surface.heightIn, 0);
+    var dpi = toNum(surface.dpi || surface.px_per_in || surface.pxPerIn, 0);
+    if (dpi > 0) PX_PER_IN = dpi;
+
+    var wPx = (wIn > 0) ? Math.round(wIn * PX_PER_IN) : canvas.getWidth();
+    var hPx = (hIn > 0) ? Math.round(hIn * PX_PER_IN) : canvas.getHeight();
+
+    // Sanity clamp
+    if (wPx < 200) wPx = 900;
+    if (hPx < 200) hPx = 600;
+
+    canvas.setWidth(wPx);
+    canvas.setHeight(hPx);
+  }
+
+  // -----------------------------
+  // Template Rendering (wrapped in try/catch)
+  // -----------------------------
+  function renderTemplateOnCanvas(template) {
+    // IMPORTANT: wrap everything so one bad field/font doesn't hang the entire page.
+    try {
+      currentTemplate = template;
+      currentSurface = pickFirstSurface(template);
+      if (!currentSurface) {
+        console.warn('[ABC Draft Editor] No surface found in template', template);
+        return;
+      }
+
+      // reset
+      fieldObjectMap = {};
+      canvas.clear();
+
+      setCanvasSizeFromSurface(currentSurface);
+
+      // Background
+      var bg = bgUrlFromSurface(currentSurface);
+      if (bg) {
+        fabric.Image.fromURL(bg, function (img) {
+          try {
+            img.set({
+              selectable: false,
+              evented: false
+            });
+            img.abcIsBackground = true;
+
+            // Fit bg to canvas
+            var sx = canvas.getWidth() / img.width;
+            var sy = canvas.getHeight() / img.height;
+            img.scaleX = sx;
+            img.scaleY = sy;
+
+            canvas.setBackgroundImage(img, canvas.requestRenderAll.bind(canvas), { crossOrigin: 'anonymous' });
+          } catch (e2) {
+            console.error('[ABC Draft Editor] Background load error', e2);
+          }
+        }, { crossOrigin: 'anonymous' });
+      } else {
+        canvas.setBackgroundColor('#ffffff', canvas.requestRenderAll.bind(canvas));
+      }
+
+      // Text fields
+      var fields = normalizeFields(currentSurface);
+
+      for (var i = 0; i < fields.length; i++) {
+        try {
+          var field = fields[i] || {};
+          var key = field.key || field.field_key || field.id || ('field_' + i);
+
+          var leftIn = toNum(field.left_in, 0);
+          var topIn = toNum(field.top_in, 0);
+          var widthIn = toNum(field.width_in, 0);
+          var heightIn = toNum(field.height_in, 0);
+
+          var align = (field.align || 'left').toString().toLowerCase();
+          var fontFamily = field.font_family || 'Arial';
+          var fontSize = toNum(field.font_size, 24);
+          var fill = field.color || '#000000';
+
+          var leftPx = leftIn * PX_PER_IN;
+          var topPx = topIn * PX_PER_IN;
+          var widthPx = (widthIn > 0 ? widthIn * PX_PER_IN : 300);
+          var heightPx = (heightIn > 0 ? heightIn * PX_PER_IN : 60);
+
+          var originX = 'left';
+          if (align === 'center') {
+            originX = 'center';
+            leftPx = (field.left_in * PX_PER_IN) + ((field.width_in * PX_PER_IN) / 2);
+          } else if (align === 'right') {
+            originX = 'right';
+            leftPx = (field.left_in * PX_PER_IN) + (field.width_in * PX_PER_IN);
+          }
+
+          var textbox = new fabric.Textbox('', {
+            left: leftPx,
+            top: topPx,
+            width: widthPx,
+            height: heightPx,
+
+            originX: originX,
+            originY: 'top',
+
+            fontSize: fontSize,
+            fontFamily: fontFamily,
+            fill: fill,
+            textAlign: align,
+
+            selectable: false,
+            evented: false
+          });
+
+          textbox.abcFieldKey = key;
+          textbox.abcFieldAlign = align;
+          textbox.abcFieldFontFamily = fontFamily;
+          textbox.abcFieldFontSize = fontSize;
+          textbox.abcFieldFill = fill;
+
+          fieldObjectMap[key] = textbox;
+          canvas.add(textbox);
+        } catch (fieldErr) {
+          console.error('[ABC Draft Editor] Field render error', fieldErr, fields[i]);
+        }
+      }
+
+      lockAllObjects();
+      canvas.requestRenderAll();
+      renderFormFields(normalizeFields(currentSurface));
+    } catch (err) {
+      console.error('[ABC Draft Editor] renderTemplateOnCanvas error', err);
+      // Keep UI usable even if the canvas fails
+      try { renderFormFields([]); } catch (e3) {}
+    }
+  }
+
+  // -----------------------------
+  // Sidebar Fields + Binding
+  // -----------------------------
+  function renderFormFields(fields) {
+    try {
+      if (!Array.isArray(fields) || !fields.length) {
+        $fieldsWrap.html('<em>No fields found for this template.</em>');
+        return;
+      }
+
+      var html = '';
+      for (var i = 0; i < fields.length; i++) {
+        var f = fields[i] || {};
+        var key = f.key || f.field_key || f.id || ('field_' + i);
+        var label = f.label || f.name || key;
+
+        html += ''
+          + '<div class="abc-field-row" style="margin:0 0 14px 0;">'
+          + '  <label style="display:block;font-weight:600;margin:0 0 6px 0;">' + esc(label) + '</label>'
+          + '  <input type="text" class="abc-field-input" data-field-key="' + esc(key) + '" style="width:100%;" />'
+          + '</div>';
+      }
+
+      $fieldsWrap.html(html);
+
+      // Bind typing -> canvas text
+      $fieldsWrap.find('.abc-field-input').off('input.abc keyup.abc').on('input.abc keyup.abc', function () {
+        var $inp = $(this);
+        var key = $inp.data('field-key');
+        var val = $inp.val();
+
+        var obj = fieldObjectMap[key];
+        if (!obj) {
+          // fallback: match by order if keys didn't serialize in old payloads
+          obj = findTextboxByIndex(key, fields);
+        }
+        if (!obj) return;
+
+        obj.set('text', val);
+
+        // Ensure style stays consistent if we add UI controls later
+        if (obj.abcFieldFontSize) obj.set('fontSize', obj.abcFieldFontSize);
+        if (obj.abcFieldFontFamily) obj.set('fontFamily', obj.abcFieldFontFamily);
+        if (obj.abcFieldFill) obj.set('fill', obj.abcFieldFill);
+        if (obj.abcFieldAlign) {
+          obj.set('textAlign', obj.abcFieldAlign);
+          if (obj.abcFieldAlign === 'center') {
+            obj.set('originX', 'center');
+          } else if (obj.abcFieldAlign === 'right') {
+            obj.set('originX', 'right');
           } else {
-            setStatus('Choose a template to start.', true);
+            obj.set('originX', 'left');
           }
-        });
+        }
+
+        canvas.requestRenderAll();
+      });
+    } catch (e) {
+      console.error('[ABC Draft Editor] renderFormFields error', e);
+      $fieldsWrap.html('<em>Error rendering fields. Check console.</em>');
+    }
+  }
+
+  function findTextboxByIndex(key, fields) {
+    // If old payloads didn't serialize abcFieldKey, we can fallback by matching
+    // the Nth textbox object to the Nth field.
+    var idx = -1;
+    for (var i = 0; i < fields.length; i++) {
+      var k = fields[i].key || fields[i].field_key || fields[i].id || ('field_' + i);
+      if (k === key) { idx = i; break; }
+    }
+    if (idx < 0) return null;
+
+    var tbs = [];
+    canvas.forEachObject(function (o) {
+      if (o && (o.type === 'textbox' || o.type === 'text')) tbs.push(o);
+    });
+    return tbs[idx] || null;
+  }
+
+  // -----------------------------
+  // Draft Loading
+  // -----------------------------
+  function loadDraft() {
+    setLoading('Loading…');
+
+    get('abc_b2b_get_draft', { draft_id: CFG.draft_id })
+      .done(function (res) {
+        if (!res || !res.success || !res.data || !res.data.draft) {
+          console.error('[ABC Draft Editor] get_draft failed', res);
+          setLoading('Unable to load draft. Check console.');
+          return;
+        }
+
+        var draft = res.data.draft;
+
+        isAdmin = !!draft.is_org_admin;
+        canBypass = !!draft.can_bypass;
+
+        setQtyInput(draft.qty);
+        bindQtyChange();
+        setOrderHeader(draft);
+
+        updateApprovalUI(draft);
+
+        // Prefer payload if exists
+        if (draft.payload) {
+          try {
+            canvas.clear();
+
+            // fabric can load from object or JSON string; we normalize to string
+            var payloadStr = (typeof draft.payload === 'string') ? draft.payload : JSON.stringify(draft.payload);
+
+            canvas.loadFromJSON(payloadStr, function () {
+              try {
+                // Rebuild field map from loaded objects
+                fieldObjectMap = {};
+                canvas.forEachObject(function (o) {
+                  if (o && o.abcFieldKey) fieldObjectMap[o.abcFieldKey] = o;
+                });
+
+                // If no background got serialized, we still fetch template to set it
+                fetchTemplateAndFinalize(draft.template_id, true);
+              } catch (e) {
+                console.error('[ABC Draft Editor] Post payload load error', e);
+                fetchTemplateAndFinalize(draft.template_id, true);
+              }
+            });
+          } catch (e2) {
+            console.error('[ABC Draft Editor] loadFromJSON failed, falling back to template', e2);
+            fetchTemplateAndFinalize(draft.template_id, false);
+          }
+        } else {
+          fetchTemplateAndFinalize(draft.template_id, false);
+        }
+      })
+      .fail(function (xhr) {
+        console.error('[ABC Draft Editor] get_draft AJAX failed', xhr);
+        setLoading('Server error loading draft. Check console.');
+      });
+  }
+
+  function fetchTemplateAndFinalize(templateId, preserveCanvasObjects) {
+    if (!templateId) {
+      setLoading('Missing template.');
+      return;
+    }
+
+    get('abc_b2b_get_template', { template_id: templateId })
+      .done(function (res) {
+        if (!res || !res.success || !res.data || !res.data.template) {
+          console.error('[ABC Draft Editor] get_template failed', res);
+          setLoading('Unable to load template. Check console.');
+          return;
+        }
+
+        var tpl = res.data.template;
+
+        if (preserveCanvasObjects) {
+          // We already loaded objects from payload. We still need sidebar fields and possibly bg.
+          currentTemplate = tpl;
+          currentSurface = pickFirstSurface(tpl);
+          if (currentSurface) {
+            var bg = bgUrlFromSurface(currentSurface);
+            // If there is no background on canvas, set it
+            if (bg && !canvas.backgroundImage) {
+              setCanvasSizeFromSurface(currentSurface);
+              fabric.Image.fromURL(bg, function (img) {
+                try {
+                  img.set({ selectable: false, evented: false });
+                  img.abcIsBackground = true;
+                  img.scaleX = canvas.getWidth() / img.width;
+                  img.scaleY = canvas.getHeight() / img.height;
+                  canvas.setBackgroundImage(img, canvas.requestRenderAll.bind(canvas), { crossOrigin: 'anonymous' });
+                } catch (e) {
+                  console.error('[ABC Draft Editor] BG set error', e);
+                }
+              }, { crossOrigin: 'anonymous' });
+            }
+            renderFormFields(normalizeFields(currentSurface));
+            lockAllObjects();
+          } else {
+            renderFormFields([]);
+          }
+        } else {
+          renderTemplateOnCanvas(tpl);
+        }
+
+        setLoading(''); // clear "Loading..."
+        $fieldsWrap.find('em').remove();
+      })
+      .fail(function (xhr) {
+        console.error('[ABC Draft Editor] get_template AJAX failed', xhr);
+        setLoading('Server error loading template. Check console.');
+      });
+  }
+
+  // -----------------------------
+  // Save / Approve / Cart
+  // -----------------------------
+  function saveDraft() {
+    if ($saveBtn.prop('disabled')) return;
+
+    $saveBtn.prop('disabled', true).text('Saving…');
+
+    var payload = JSON.stringify(canvas.toJSON(['abcFieldKey','abcFieldAlign','abcFieldFontFamily','abcFieldFontSize','abcFieldFill']));
+
+    // single surface preview for now
+    var previews = {};
+    try {
+      previews.front = canvas.toDataURL({ format: 'png', multiplier: 2 });
+    } catch (e) {
+      console.warn('[ABC Draft Editor] Preview generation failed', e);
+    }
+
+    post('abc_b2b_save_draft', {
+      draft_id: CFG.draft_id,
+      payload: payload,
+      previews: previews
+    }).done(function (res) {
+      if (!res || !res.success) {
+        alert((res && res.data && res.data.message) ? res.data.message : 'Error saving draft.');
+      } else {
+        // approvals reset happens on save server-side, so reflect UI
+        updateApprovalUI({ employee_ready: 0, admin_ready: 0, ready_override: 0, is_org_admin: isAdmin, can_bypass: canBypass });
       }
+    }).fail(function (xhr) {
+      console.error('[ABC Draft Editor] save_draft AJAX failed', xhr);
+      alert('Server error saving draft. Check console.');
+    }).always(function () {
+      $saveBtn.prop('disabled', false).text('Save Proof');
+    });
+  }
+
+  function setReady(action, $btn, doneText) {
+    if ($btn.prop('disabled')) return;
+    $btn.prop('disabled', true);
+
+    post(action, { draft_id: CFG.draft_id })
+      .done(function (res) {
+        if (!res || !res.success) {
+          alert((res && res.data && res.data.message) ? res.data.message : 'Error updating status.');
+          $btn.prop('disabled', false);
+          return;
+        }
+        $btn.text(doneText).prop('disabled', true);
+        // refresh draft flags quickly
+        loadDraft();
+      })
+      .fail(function (xhr) {
+        console.error('[ABC Draft Editor] status AJAX failed', xhr);
+        $btn.prop('disabled', false);
+        alert('Server error. Check console.');
+      });
+  }
+
+  function addToCart() {
+    if ($addToCartBtn.prop('disabled')) return;
+    $addToCartBtn.prop('disabled', true).text('Adding…');
+
+    post('abc_b2b_add_draft_to_cart', { draft_id: CFG.draft_id })
+      .done(function (res) {
+        if (res && res.success && res.data && res.data.cart_url) {
+          window.location.href = res.data.cart_url;
+          return;
+        }
+        alert((res && res.data && res.data.message) ? res.data.message : 'Could not add to cart.');
+        $addToCartBtn.prop('disabled', false).text('Add to Cart');
+      })
+      .fail(function (xhr) {
+        console.error('[ABC Draft Editor] add_to_cart AJAX failed', xhr);
+        alert('Server error adding to cart. Check console.');
+        $addToCartBtn.prop('disabled', false).text('Add to Cart');
+      });
+  }
+
+  // -----------------------------
+  // Event bindings
+  // -----------------------------
+  $saveBtn.off('click.abc').on('click.abc', function (e) {
+    e.preventDefault();
+    saveDraft();
+  });
+
+  $employeeBtn.off('click.abc').on('click.abc', function (e) {
+    e.preventDefault();
+    setReady('abc_b2b_set_employee_ready', $employeeBtn, 'Employee Ready ✓');
+  });
+
+  $adminBtn.off('click.abc').on('click.abc', function (e) {
+    e.preventDefault();
+    setReady('abc_b2b_set_admin_ready', $adminBtn, 'Org Admin Ready ✓');
+  });
+
+  $addToCartBtn.off('click.abc').on('click.abc', function (e) {
+    e.preventDefault();
+    addToCart();
+  });
+
+  $tplSelect.off('change.abc').on('change.abc', function () {
+    var tid = parseInt($(this).val(), 10);
+    if (!tid) return;
+
+    post('abc_b2b_set_draft_template', {
+      draft_id: CFG.draft_id,
+      template_id: tid
+    }).done(function (res) {
+      if (!res || !res.success) {
+        alert((res && res.data && res.data.message) ? res.data.message : 'Could not change template.');
+        return;
+      }
+      window.location.reload();
+    }).fail(function (xhr) {
+      console.error('[ABC Draft Editor] set_draft_template failed', xhr);
+      alert('Server error changing template. Check console.');
     });
   });
 
-})(jQuery);
+  // -----------------------------
+  // Boot
+  // -----------------------------
+  loadDraft();
+});
